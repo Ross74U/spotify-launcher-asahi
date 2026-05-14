@@ -1,0 +1,13 @@
+# Rust build output
+/spotify-launcher/target/
+
+# Pipeline-generated Spotify client artifacts; regenerate with ./run-pipeline.sh
+/spotify-client-deb/
+/spotify-client-extracted/
+/latest-*-deb-url.txt
+/latest-amd64-deb-url.txt
+
+# Logs/temp
+*.log
+*.stderr
+/tmp/

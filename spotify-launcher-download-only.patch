@@ -1,0 +1,258 @@
+diff --git a/src/apt.rs b/src/apt.rs
+index a601fb3..9e66ae5 100644
+--- a/src/apt.rs
++++ b/src/apt.rs
+@@ -1,5 +1,5 @@
+ use crate::crypto;
+-use crate::deb::{self, Pkg};
++use crate::deb::{self, Architecture, Pkg};
+ use crate::errors::*;
+ use crate::http;
+ use crate::pgp;
+@@ -22,7 +22,11 @@ impl Client {
+         Ok(Client { client })
+     }
+ 
+-    pub async fn fetch_pkg_release(&self, keyring_path: &Path) -> Result<Pkg> {
++    pub async fn fetch_pkg_release(
++        &self,
++        keyring_path: &Path,
++        architecture: &Architecture,
++    ) -> Result<Pkg> {
+         info!("Downloading release file...");
+         let release = self
+             .client
+@@ -52,8 +56,7 @@ impl Client {
+ 
+         info!("Signature verified successfully!");
+         let release = deb::parse_release_file(&String::from_utf8(release)?)?;
+-        let arch = deb::Architecture::current();
+-        let debian_arch_str = arch.to_debian_str();
++        let debian_arch_str = architecture.to_debian_str();
+ 
+         if !release.architectures.iter().any(|a| a == debian_arch_str) {
+             bail!(
+@@ -104,7 +107,7 @@ impl Client {
+         url: &str,
+         deb: &mut Vec<u8>,
+         hasher: &mut Sha256,
+-        pb: &mut ProgressBar,
++        pb: &mut Option<ProgressBar>,
+         offset: &mut Option<u64>,
+     ) -> Result<()> {
+         let mut dl = self.client.fetch_stream(url, *offset).await?;
+@@ -113,8 +116,14 @@ impl Client {
+             hasher.update(&chunk);
+             *offset = Some(dl.progress);
+ 
+-            let progress = (dl.progress as f64 / dl.total as f64 * 100.0) as u64;
+-            pb.update(progress).await?;
++            let progress = if dl.total > 0 {
++                (dl.progress as f64 / dl.total as f64 * 100.0) as u64
++            } else {
++                0
++            };
++            if let Some(pb) = pb {
++                pb.update(progress).await?;
++            }
+             debug!(
+                 "Download progress: {}%, {}/{}",
+                 progress, dl.progress, dl.total
+@@ -123,7 +132,12 @@ impl Client {
+         Ok(())
+     }
+ 
+-    pub async fn download_pkg(&self, pkg: &Pkg, max_download_attempts: usize) -> Result<Vec<u8>> {
++    pub async fn download_pkg(
++        &self,
++        pkg: &Pkg,
++        max_download_attempts: usize,
++        show_progress: bool,
++    ) -> Result<Vec<u8>> {
+         let filename = pkg
+             .filename
+             .rsplit_once('/')
+@@ -137,7 +151,11 @@ impl Client {
+         let url = pkg.download_url();
+ 
+         // download
+-        let mut pb = ProgressBar::spawn()?;
++        let mut pb = if show_progress {
++            Some(ProgressBar::spawn()?)
++        } else {
++            None
++        };
+         let mut deb = Vec::new();
+         let mut hasher = Sha256::new();
+         let mut offset = None;
+@@ -161,7 +179,9 @@ impl Client {
+             {
+                 warn!("Download has failed: {err:#}");
+             } else {
+-                pb.close().await?;
++                if let Some(pb) = &mut pb {
++                    pb.close().await?;
++                }
+ 
+                 // verify checksum
+                 info!("Verifying with sha256sum hash...");
+@@ -178,7 +198,9 @@ impl Client {
+             }
+         }
+ 
+-        pb.close().await?;
++        if let Some(pb) = &mut pb {
++            pb.close().await?;
++        }
+         bail!("Exceeded number of retries for download");
+     }
+ }
+diff --git a/src/args.rs b/src/args.rs
+index a49e44d..d8bf40f 100644
+--- a/src/args.rs
++++ b/src/args.rs
+@@ -9,6 +9,12 @@ pub struct Args {
+     /// Use a local .deb file instead of downloading one
+     #[arg(long)]
+     pub deb: Option<PathBuf>,
++    /// Download the Spotify .deb into this directory and exit without extracting or executing it
++    #[arg(long)]
++    pub download_dir: Option<PathBuf>,
++    /// Debian architecture to download, overriding the current CPU (for example: amd64, i386)
++    #[arg(long)]
++    pub architecture: Option<String>,
+     /// Install into specific directory
+     #[arg(long)]
+     pub install_dir: Option<PathBuf>,
+diff --git a/src/deb.rs b/src/deb.rs
+index d518a10..288c840 100644
+--- a/src/deb.rs
++++ b/src/deb.rs
+@@ -11,6 +11,14 @@ pub enum Architecture {
+ }
+ 
+ impl Architecture {
++    pub fn from_debian_str(arch: &str) -> Architecture {
++        match arch {
++            "amd64" => Architecture::Amd64,
++            "i386" => Architecture::I386,
++            _ => Architecture::Unknown(Box::leak(arch.to_string().into_boxed_str())),
++        }
++    }
++
+     pub const fn current() -> Architecture {
+         if cfg!(target_arch = "x86_64") {
+             Architecture::Amd64
+diff --git a/src/main.rs b/src/main.rs
+index 00a0485..1eeca7c 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -4,12 +4,13 @@ use spotify_launcher::apt;
+ use spotify_launcher::apt::Client;
+ use spotify_launcher::args::Args;
+ use spotify_launcher::config::ConfigFile;
++use spotify_launcher::deb::Architecture;
+ use spotify_launcher::errors::*;
+ use spotify_launcher::extract;
+ use spotify_launcher::paths;
+ use spotify_launcher::ui;
+ use std::ffi::CString;
+-use std::path::Path;
++use std::path::{Path, PathBuf};
+ use std::time::Duration;
+ use std::time::SystemTime;
+ use tokio::fs;
+@@ -46,13 +47,45 @@ async fn should_update(args: &Args, state: Option<&paths::State>) -> Result<bool
+     }
+ }
+ 
+-async fn print_deb_url(args: &Args) -> Result<()> {
++async fn print_deb_url(args: &Args, architecture: &Architecture) -> Result<()> {
+     let client = Client::new(args.timeout)?;
+-    let pkg = client.fetch_pkg_release(&args.keyring).await?;
++    let pkg = client
++        .fetch_pkg_release(&args.keyring, architecture)
++        .await?;
+     println!("{}", pkg.download_url());
+     Ok(())
+ }
+ 
++async fn download_deb(
++    args: &Args,
++    architecture: &Architecture,
++    download_attempts: usize,
++) -> Result<PathBuf> {
++    let download_dir = args
++        .download_dir
++        .as_ref()
++        .context("Missing --download-dir")?;
++    fs::create_dir_all(download_dir)
++        .await
++        .with_context(|| anyhow!("Failed to create download directory {:?}", download_dir))?;
++
++    let client = Client::new(args.timeout)?;
++    let pkg = client
++        .fetch_pkg_release(&args.keyring, architecture)
++        .await?;
++    let filename = pkg
++        .filename
++        .rsplit_once('/')
++        .map(|(_, x)| x)
++        .unwrap_or("spotify-client.deb");
++    let output = download_dir.join(filename);
++    let deb = client.download_pkg(&pkg, download_attempts, false).await?;
++    fs::write(&output, deb)
++        .await
++        .with_context(|| anyhow!("Failed to write downloaded .deb to {:?}", output))?;
++    Ok(output)
++}
++
+ async fn update(
+     args: &Args,
+     state: Option<&paths::State>,
+@@ -68,8 +101,15 @@ async fn update(
+             version: "0".to_string(),
+         }
+     } else {
++        let architecture = args
++            .architecture
++            .as_deref()
++            .map(Architecture::from_debian_str)
++            .unwrap_or_else(Architecture::current);
+         let client = Client::new(args.timeout)?;
+-        let pkg = client.fetch_pkg_release(&args.keyring).await?;
++        let pkg = client
++            .fetch_pkg_release(&args.keyring, &architecture)
++            .await?;
+ 
+         match state {
+             Some(state) if state.version == pkg.version && !args.force_update => {
+@@ -80,7 +120,7 @@ async fn update(
+                 }
+             }
+             _ => {
+-                let deb = client.download_pkg(&pkg, download_attempts).await?;
++                let deb = client.download_pkg(&pkg, download_attempts, false).await?;
+                 VersionCheck {
+                     deb: Some(deb),
+                     version: pkg.version,
+@@ -165,8 +205,18 @@ async fn main() -> Result<()> {
+             .unwrap_or(apt::DEFAULT_DOWNLOAD_ATTEMPTS)
+     });
+ 
++    let architecture = args
++        .architecture
++        .as_deref()
++        .map(Architecture::from_debian_str)
++        .unwrap_or_else(Architecture::current);
++    debug!("Using debian architecture: {:?}", architecture);
++
+     if args.print_deb_url {
+-        print_deb_url(&args).await?;
++        print_deb_url(&args, &architecture).await?;
++    } else if args.download_dir.is_some() {
++        let output = download_deb(&args, &architecture, download_attempts).await?;
++        println!("{}", output.display());
+     } else {
+         let state = paths::load_state_file().await?;
+         if should_update(&args, state.as_ref()).await? {
