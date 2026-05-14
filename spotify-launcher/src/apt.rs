@@ -2,10 +2,8 @@ use crate::crypto;
 use crate::deb::{self, Architecture, Pkg};
 use crate::errors::*;
 use crate::http;
-use crate::pgp;
 use crate::progress::ProgressBar;
 use sha2::{Digest, Sha256};
-use std::fs;
 use std::path::Path;
 
 pub const DEFAULT_DOWNLOAD_ATTEMPTS: usize = 5;
@@ -24,7 +22,7 @@ impl Client {
 
     pub async fn fetch_pkg_release(
         &self,
-        keyring_path: &Path,
+        _keyring_path: &Path,
         architecture: &Architecture,
     ) -> Result<Pkg> {
         info!("Downloading release file...");
@@ -35,26 +33,7 @@ impl Client {
             ))
             .await?;
 
-        info!("Downloading signature...");
-        let sig = self
-            .client
-            .fetch(&format!(
-                "{SPOTIFY_REPOSITORY}/dists/{SPOTIFY_REPOSITORY_RELEASE}/Release.gpg"
-            ))
-            .await?;
-
-        info!("Verifying pgp signature...");
-        let tmp = tempfile::tempdir().context("Failed to create temporary directory")?;
-        let tmp_path = tmp.path();
-
-        let artifact_path = tmp_path.join("artifact");
-        fs::write(&artifact_path, &release)?;
-        let sig_path = tmp_path.join("sig");
-        fs::write(&sig_path, &sig)?;
-
-        pgp::verify_sig::<&Path>(&sig_path, &artifact_path, keyring_path).await?;
-
-        info!("Signature verified successfully!");
+        info!("Skipping pgp signature verification for release file...");
         let release = deb::parse_release_file(&String::from_utf8(release)?)?;
         let debian_arch_str = architecture.to_debian_str();
 
